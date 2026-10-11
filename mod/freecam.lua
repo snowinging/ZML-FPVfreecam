@@ -21,6 +21,8 @@ rawset(_G,'ZMLFreecamInst',INST)
 
 -- 报点：事件名走 api.report（只收 a-z0-9_:-），同名事件限流，错误详情走 logger 且限次。
 local lastEvent,lastEventAt,loggedErrors=nil,-1,0
+local pushText                      -- 由下面 FPV 那半接上：出错时把完整正文写进模组日志
+local FPV                           -- 遥控接管那半，见文件下方 ZMLFCFpv（必须在 announce 之前声明）
 local function reportEvent(event,err)
     local now=U.Time.realtimeSinceStartup
     event=tostring(event)
@@ -30,7 +32,14 @@ local function reportEvent(event,err)
     end
     if err then
         -- 报错正文顺手编成一个合法事件名，这样在 runtime.log 里直接看得见，不依赖 logger。
+        -- 但事件名只有 60 字符，够看是哪一行、看不到变量名，所以正文再走一遍中文日志通道。
         pcall(api.report,ID,'err_'..tostring(err):lower():gsub('[^a-z0-9]',''):sub(1,60))
+        if pushText then
+            local text=tostring(err)
+            for i=1,math.min(4,math.max(1,math.ceil(#text/150))) do
+                pcall(pushText,'freecam 出错：'..text:sub((i-1)*150+1,i*150))
+            end
+        end
     end
     if err and loggedErrors<3 then
         loggedErrors=loggedErrors+1
@@ -88,7 +97,6 @@ local function announce(text)
 end
 
 local action,handles,unsubscribe
-local FPV                                       -- 遥控接管那半，见文件下方 ZMLFCFpv
 local MOVE_ACTIONS={
     {key='f',id='forward',label='前进',primary='I'},
     {key='b',id='back',label='后退',primary='K'},
@@ -122,14 +130,13 @@ local function ensureKeys()
         if h~=nil and type(h.down)=='function' then M.acts[def.key]=h;n=n+1 end
     end
     M.bound=n
-    M.fpvKeys=nil
-    if FPV then
-        M.fpvKeys={}
-        for _,def in ipairs(FPV_ACTIONS) do
-            local h=k.find(ID,def.id)
-            if h==nil then h=k.register(ID,{id=def.id,name='自由镜头 · '..def.label,primary=def.primary,secondary='None'}) end
-            if h~=nil and type(h.pressed)=='function' then M.fpvKeys[def.key]=h end
-        end
+    -- 这三个键不管有没有 FPV 模块都注册：看得见它们，就说明模组加载上了。
+    -- 真按下去而没有 FPV 模块，就当面说清楚，别装死。
+    M.fpvKeys={}
+    for _,def in ipairs(FPV_ACTIONS) do
+        local h=k.find(ID,def.id)
+        if h==nil then h=k.register(ID,{id=def.id,name='自由镜头 · '..def.label,primary=def.primary,secondary='None'}) end
+        if h~=nil and type(h.pressed)=='function' then M.fpvKeys[def.key]=h end
     end
 end
 function P.pressed() return action and action.pressed() or false end
@@ -170,8 +177,12 @@ local function axis(name)
 end
 
 M=ZMLFCFactory(P)
--- 遥控接管：模组 C++ 侧注入的模块，没注入成就是 nil，功能自然关着。
-FPV=ZMLFCFpv
+-- 遥控接管：模组 C++ 侧注入的模块。C++ 那层只相当于调掉了外壳，ZMLFCFpv 还是工厂，
+-- 得自己再叫一声；拼装方式见 src/plugin.cpp 的 start()。拿不到就当没这功能，键鼠照常。
+local fpvMod=ZMLFCFpv
+if type(fpvMod)=='function' then pcall(function() fpvMod=fpvMod() end) end
+FPV=(type(fpvMod)=='table') and fpvMod or nil
+if FPV and type(FPV.log)=='function' then pushText=FPV.log end
 
 local function number(v,name,lo,hi,fallback)
     local x=v[name]
@@ -255,7 +266,7 @@ function M.forceClose() M.wanted=false;return M.release(true) end
 -- 视角输入：吃掉游戏相机管线里的鼠标增量（与第一人称同一条路）。
 function M.move(ctrl,delta)
     if M.busy~=nil or not M.holding() then return false end
-    if FPV and FPV.on then return true end      -- 遥控接管期间鼠标不动相机，但增量要吃掉
+    if FPV and not M.fpvBroken and FPV.on then return true end  -- 遥控接管期间鼠标不动相机，但增量要吃掉
     local x,y=0,0
     if delta then x,y=delta.x,delta.y end
     if DeviceInfo.usingController then x=x*90;y=y*90 end
@@ -317,22 +328,36 @@ local function diag(f,r,u,mx,my)
         INST,math.floor(f*10),math.floor(r*10),math.floor(u*10),
         math.floor(mx*10),math.floor(my*10),
         (M.acts and not M.actsBroken) and 1 or 0,input.axis and 1 or 0,M.moveHits or 0,M.reentry or 0))
-    if FPV then reportEvent('fpv_i'..INST..'_'..FPV.status()) end
+    if FPV and not M.fpvBroken then reportEvent('fpv_i'..INST..'_'..FPV.status()) end
+end
+
+-- 遥控接管那半每帧的动作：心跳 + 游戏内三个键。
+-- 整段外面套了 pcall：FPV 那半就算炸了，也只能让遥控功能自己歇着，键鼠飞行照旧。
+local function fpvTick(dt)
+    if FPV then FPV.heartbeat(M,dt) end
+    local keys=M.fpvKeys
+    if keys==nil then return end
+    local function need() announce('FPV：没拿到 C++ 那半注入的模块（FreeCam.dll 八成不是新版），这个键用不了') end
+    if pressedEdge('recv',keys.recv) then
+        if FPV then announce('FPV：游戏内接收开关 → '..(FPV.toggleRecv() and '开' or '关（遥控器不再接管，键鼠照常）'))
+        else need() end
+    end
+    if pressedEdge('force',keys.force) then
+        if FPV then announce('FPV：强制接管 → '..(FPV.toggleForce() and '开（忽略 arm、校准、映射检查，排障用）' or '关'))
+        else need() end
+    end
+    if pressedEdge('check',keys.check) then
+        if FPV then announce(FPV.describe())
+        else announce('FPV 自检：没拿到 C++ 那半注入的模块（FreeCam.dll 八成不是新版），游戏侧和辅助程序侧的链路都查不了') end
+    end
 end
 
 local function frameBody(dt)
     if not M.settings then return end
     dt=clamp(tonumber(dt) or 0,0,.1)
-    if FPV then FPV.heartbeat(M,dt) end
-    local keys=FPV and M.fpvKeys
-    if keys then
-        if pressedEdge('recv',keys.recv) then
-            announce('FPV：游戏内接收开关 → '..(FPV.toggleRecv() and '开' or '关（遥控器不再接管，键鼠照常）'))
-        end
-        if pressedEdge('force',keys.force) then
-            announce('FPV：强制接管 → '..(FPV.toggleForce() and '开（忽略 arm、校准、映射检查，排障用）' or '关'))
-        end
-        if pressedEdge('check',keys.check) then announce(FPV.describe()) end
+    if not M.fpvBroken then
+        local ok=pcall(fpvTick,dt)
+        if not ok then M.fpvBroken=true;reportEvent('fpv_fail') end
     end
     if P.pressed() then M.toggle() end
     if M.lease and M.lease.releasing then
@@ -372,7 +397,7 @@ local function frameBody(dt)
     end
     local c=M.settings
     local f,r,u,boost,mx,my
-    if FPV and FPV.pull(M) then
+    if FPV and not M.fpvBroken and FPV.pull(M) then
         f=FPV.attitude(M,dt,c)                  -- 遥控接管：角速率积分姿态，油门当推力
         r,u,boost,mx,my=0,0,false,0,0
     else
