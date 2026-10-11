@@ -39,7 +39,7 @@ L = lupa.LuaRuntime()
 # 游戏里的 Lua 是 5.1 血统，有 loadstring；lupa 自带的 5.5 没有，补一个（和
 # Endfield-FirstPerson/tests/native_mock.lua 一个写法）。
 L.execute('loadstring = load')
-L.execute('LuaManagerInst = { LoadLua = function(self, path) return __SRC end }')
+L.execute('LuaManagerInst = { last=0, n=0, LoadLua = function(self, path) self.last=path; self.n=self.n+1; return __SRC end }')
 _load = L.eval('function(s) local f,e=load(s, "@fpv_link"); if f==nil then error(e) end return f end')
 F = _load(MOD.read_text())()()
 DT = 0.02
@@ -180,6 +180,59 @@ state(roll=0)
 M.roll = -20
 F.pull(M)
 check('相机不在手上时直接清掉横滚', M.roll is None)
+
+print('游戏内开关（Ctrl+F7 / F8）')
+M = mkM()
+state()
+check('默认开着', F.recv and F.pull(M) and F.why == 'ok')
+M.roll = -5
+F.toggleRecv()
+check('关掉接收立刻不接管', (not F.pull(M)) and F.why == 'recv_off', '→ %s' % F.why)
+check('关掉时当场交还横滚', M.roll is None, 'roll=%s' % M.roll)
+F.toggleRecv()
+check('再拨回来又能接管', F.pull(M) and F.why == 'ok')
+
+print('强制接管（Ctrl+F8）：只留"还有没有新包"这条底线')
+bypass = [('hold', dict(hold=1)), ('calib', dict(calib=1)),
+          ('disarmed', dict(armed=0, flags=ST_VALID)), ('not_valid', dict(flags=ST_ARMED))]
+for name, kw in bypass:
+    M = mkM()
+    state(**kw)
+    before, beforeWhy = F.pull(M), F.why
+    F.toggleForce()
+    after = F.pull(M)
+    check('强制接管放过 ' + name, (not before) and after and F.on,
+          '%s → 强制后 ok' % beforeWhy)
+    F.toggleForce()
+    state(**kw)
+M = mkM()
+state(age=400)
+F.toggleForce()
+check('强制接管也拦不住"包断了"', not F.pull(M) and F.why == 'stale', '→ %s' % F.why)
+F.toggleForce()
+
+print('自检串与日志通道')
+state(seq=7, roll=1, pitch=2, yaw=3, throttle=4, switches=5)
+M = mkM()
+F.pull(M)
+d = F.describe()
+check('自检串是人话', '自检' in d and 'seq 7' in d and 'roll 1' in d, d)
+check('status 带接收开关状态', '_r0' in F.status() if not F.recv else '_ok_' in F.status(), F.status())
+F.toggleRecv()
+check('关掉后 status 标 r0', '_r0' in F.status(), F.status())
+F.toggleRecv()
+M = mkM()
+state()
+F.pull(M)
+ok = F.log('fpv 自检：测试中文日志')
+path = str(L.globals()['LuaManagerInst'].last)
+check('日志走 log- 十六进制通道', ok and path.startswith('ZML/Mod/freecam/log-'), path[:40] + '...')
+raw = bytes.fromhex(path.split('log-', 1)[1]).decode('utf-8')
+check('十六进制解回中文', raw == 'fpv 自检：测试中文日志', raw)
+check('路径字符集合法', all(c.isalnum() or c in '.-_/' for c in path), '长度 %d' % len(path))
+long = F.log('很长的一句话' * 40)
+check('超长自检串截断不报错', long and len(L.globals()['LuaManagerInst'].last) < 500,
+      '长度 %d' % len(str(L.globals()['LuaManagerInst'].last)))
 
 print('诊断串')
 state(seq=42, roll=1, pitch=2, yaw=3, throttle=4, switches=5)

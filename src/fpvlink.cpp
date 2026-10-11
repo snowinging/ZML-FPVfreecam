@@ -58,6 +58,8 @@ struct Snapshot {
     unsigned long long recvAt{};      // GetTickCount64，用来算 age
     bool have{};
     unsigned int lost{};
+    unsigned long long totalRecv{};   // 累计收到的合法包（不管有没有被接管）
+    unsigned int bad{};               // 尺寸或校验不对的包：有它说明确实有东西在往这个端口发
     // Lua 侧推回来的（用 LoadLua 走 push_ 路径）
     bool camera{};
     unsigned int gameFps{};
@@ -76,6 +78,12 @@ HANDLE threadHandle{};
 
 void setText(std::string& out, const char* name, long long value) {
     out += name; out += '='; out += std::to_string(value); out += ',';
+}
+
+// 模组日志（%LOCALAPPDATA%\ZML\runtime.log）。Lua 那边也能借它写可读中文：
+// 路径 ZML/Mod/freecam/log-<十六进制>，见 applyPush。
+void logLine(const std::string& text) {
+    if (hostApi && hostApi->log) hostApi->log(hostApi->owner, text.c_str());
 }
 
 // 现生成给 Lua 的那一小段源码。字段和 fpv_link.lua 里读的一一对应。
@@ -104,6 +112,9 @@ std::string stateSource() {
     setText(out, "buttons", copy.buttons);
     setText(out, "aux", copy.aux);
     setText(out, "lost", copy.lost);
+    setText(out, "rx", static_cast<long long>(copy.totalRecv));
+    setText(out, "bad", copy.bad);
+    setText(out, "bind", 1);          // 能走到这里就说明端口绑上了
     setText(out, "fps", copy.gameFps);
     if (!out.empty() && out.back() == ',') out.pop_back();
     out += "}";
@@ -124,7 +135,22 @@ void applyPush(const char* path) {
         size_t dash = item.find('-');
         if (dash == std::string::npos) continue;
         std::string key = item.substr(0, dash), value = item.substr(dash + 1);
-        if (key == "cam") camera = value == "1";
+        if (key == "log") {                       // 十六进制，里面是 UTF-8 正文
+            auto nibble = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            std::string line;
+            for (size_t i = 0; i + 1 < value.size(); i += 2) {
+                int hi = nibble(value[i]), lo = nibble(value[i + 1]);
+                if (hi < 0 || lo < 0) break;
+                line += static_cast<char>(hi * 16 + lo);
+            }
+            if (!line.empty()) logLine(line);
+        }
+        else if (key == "cam") camera = value == "1";
         else if (key == "fps") { try { fps = static_cast<unsigned int>(std::stoul(value)); } catch (...) {} }
         else if (key == "reset") reset = true;
     }
@@ -144,7 +170,7 @@ int luaSource(void*, const char* relativePath, ZmlSink sink, void* writer) {
         sink(writer, text.data(), text.size());
         return 1;
     }
-    if (path.rfind("push", 0) == 0) {
+    if (path.rfind("push", 0) == 0 || path.rfind("log", 0) == 0) {
         applyPush(path.c_str());
         static const char answer[] = "return true";
         sink(writer, answer, sizeof(answer) - 1);
@@ -179,12 +205,6 @@ void reply(const sockaddr_in& to, unsigned int now) {
         reinterpret_cast<const sockaddr*>(&to), sizeof(to));
 }
 
-// 收包线程每隔一秒往模组日志里写一行，方便在游戏里出问题时定位：
-// 是压根没收到包，还是收到了却没被接管。日志在 %LOCALAPPDATA%\ZML\runtime.log。
-void logLine(const std::string& text) {
-    if (hostApi && hostApi->log) hostApi->log(hostApi->owner, text.c_str());
-}
-
 DWORD WINAPI receiveLoop(void*) {
     sockaddr_in from{};
     int fromSize = sizeof(from);
@@ -207,6 +227,11 @@ DWORD WINAPI receiveLoop(void*) {
             fromSize = sizeof(from);
             int got = recvfrom(sock, buffer, sizeof(buffer), 0, reinterpret_cast<sockaddr*>(&from), &fromSize);
             if (got > 0) {
+                if (got != static_cast<int>(sizeof(WireState))) {
+                    EnterCriticalSection(&lock);
+                    ++snapshot.bad;          // 端口上有东西在发，但不是我们认的那个包
+                    LeaveCriticalSection(&lock);
+                }
                 if (got == static_cast<int>(sizeof(WireState))) {
                     WireState packet{};
                     std::memcpy(&packet, buffer, sizeof(packet));
@@ -230,6 +255,7 @@ DWORD WINAPI receiveLoop(void*) {
                         snapshot.have = true;
                         lastRecv = snapshot.recvAt;
                         ++received;
+                        ++snapshot.totalRecv;
                         LeaveCriticalSection(&lock);
                     }
                 }
@@ -243,6 +269,7 @@ DWORD WINAPI receiveLoop(void*) {
             unsigned short seq = snapshot.seq;
             unsigned int lost = snapshot.lost;
             unsigned int age = have ? (now - static_cast<unsigned int>(snapshot.recvAt)) : 0;
+            unsigned int bad = snapshot.bad;
             LeaveCriticalSection(&lock);
             if (have && !announced) {
                 announced = true;
@@ -252,12 +279,14 @@ DWORD WINAPI receiveLoop(void*) {
                 if (now - lastEmptyLog >= 5000) {
                     lastEmptyLog = now;
                     logLine("fpv 还没收到状态包（端口 " + std::to_string(kPort) +
-                        "），辅助程序那头的「发给游戏」开了吗");
+                        (bad ? "）；反而收到 " + std::to_string(bad) + " 个不对的包，八成是版本对不上"
+                             : "），辅助程序那头的「发给游戏」开了吗"));
                 }
             } else if (received != lastReported) {
                 lastReported = received;
                 logLine("fpv 收 " + std::to_string(received) + " 包，最新 seq " + std::to_string(seq) +
-                    "，缺 " + std::to_string(lost) + "，age " + std::to_string(age) + "ms");
+                    "，缺 " + std::to_string(lost) + "，age " + std::to_string(age) + "ms" +
+                    (bad ? "，另有 " + std::to_string(bad) + " 个坏包" : ""));
             }
         }
     }
@@ -302,13 +331,19 @@ bool start(const ZmlHost* host) noexcept {
         WSADATA data{};
         WSAStartup(MAKEWORD(2, 2), &data);
         sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (sock == INVALID_SOCKET) return false;
+        if (sock == INVALID_SOCKET) {
+            hostApi->log(hostApi->owner, "fpv link: 建不出 UDP 套接字，遥控接管这一半没生效");
+            return false;
+        }
         sockaddr_in address{};
         address.sin_family = AF_INET;
         address.sin_port = htons(kPort);
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (bind(sock, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
-            closesocket(sock); sock = INVALID_SOCKET; return false;
+            closesocket(sock); sock = INVALID_SOCKET;
+            logLine("fpv link: 端口 " + std::to_string(kPort) +
+                " 绑不上（被别的程序占了，或者被安全软件拦了），遥控接管这一半没生效");
+            return false;
         }
         u_long nonBlocking = 1;
         ioctlsocket(sock, FIONBIO, &nonBlocking);

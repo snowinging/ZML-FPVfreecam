@@ -41,7 +41,54 @@ local function reportEvent(event,err)
 end
 local P={report=reportEvent}
 
+-- 游戏内弹提示：各版本 UI 入口名字不一样，挨个试；一个都不成也只是说不了话，功能照旧。
+local toasts,toastProbed
+local function toast(text)
+    if not toastProbed then
+        toastProbed=true
+        toasts={}
+        pcall(require_ex,'Common/Utils/UIUtils')      -- 顺手把 UIUtils 带进 _G
+        for _,holder in ipairs({'UIUtils','TipsManager','TipManager','TipsModule','MessageTip'}) do
+            local t=rawget(_G,holder)
+            if type(t)=='table' then
+                for _,f in ipairs({'ShowTips','ShowTip','ShowCommonTips','ShowMessage','Show'}) do
+                    if type(t[f])=='function' then toasts[#toasts+1]={t,f};break end
+                end
+            end
+        end
+    end
+    for _,c in ipairs(toasts or {}) do
+        if pcall(c[1][c[2]],text) then return true end
+    end
+    return false
+end
+
+-- 按键取上升沿：keybinds 的 pressed() 是边沿语义，但万一某个版本给的是"按住"，
+-- 那就靠上一帧的状态自己造边沿，免得按一下连翻好几次。
+local keyHeld={}
+local function pressedEdge(name,handle)
+    if handle==nil then return false end
+    local ok,down=pcall(handle.pressed)
+    down=(ok and down) and true or false
+    local was=keyHeld[name]
+    keyHeld[name]=down
+    return down and not was
+end
+
+-- 说一句人话：优先借 C++ 那半的模组日志（正文可读），再试游戏内提示，
+-- 最后至少留个事件名在 runtime.log 里，让人知道按了什么。
+local function announce(text)
+    text=tostring(text)
+    local viaLog=FPV and FPV.log and pcall(FPV.log,text) or false
+    local viaToast=toast(text)
+    if not pcall(function() logger.info('ZML FreeCam: '..text) end) then
+        pcall(function() logger.error('ZML FreeCam: '..text) end)
+    end
+    reportEvent('say_'..(viaLog and 'l' or 'n')..(viaToast and 't' or 'n'))
+end
+
 local action,handles,unsubscribe
+local FPV                                       -- 遥控接管那半，见文件下方 ZMLFCFpv
 local MOVE_ACTIONS={
     {key='f',id='forward',label='前进',primary='I'},
     {key='b',id='back',label='后退',primary='K'},
@@ -50,6 +97,13 @@ local MOVE_ACTIONS={
     {key='u',id='up',label='上升',primary='U'},
     {key='d',id='down',label='下降',primary='O'},
     {key='boost',id='boost',label='加速',primary='LeftShift'},
+}
+-- 遥控接管在游戏内的三个键，都进游戏原生按键设置，绑什么主人自己改。
+-- 这三个键本身就是检测：按键列表里能看见它们，说明模组加载上了。
+local FPV_ACTIONS={
+    {key='recv',id='fpv_recv',label='遥控接收开关',primary='Ctrl+F7'},
+    {key='force',id='fpv_force',label='遥控强制接管',primary='Ctrl+F8'},
+    {key='check',id='fpv_check',label='遥控链路自检',primary='Ctrl+F9'},
 }
 local function ensureKeys()
     require_ex('Common/Utils/UIUtils')
@@ -68,6 +122,15 @@ local function ensureKeys()
         if h~=nil and type(h.down)=='function' then M.acts[def.key]=h;n=n+1 end
     end
     M.bound=n
+    M.fpvKeys=nil
+    if FPV then
+        M.fpvKeys={}
+        for _,def in ipairs(FPV_ACTIONS) do
+            local h=k.find(ID,def.id)
+            if h==nil then h=k.register(ID,{id=def.id,name='自由镜头 · '..def.label,primary=def.primary,secondary='None'}) end
+            if h~=nil and type(h.pressed)=='function' then M.fpvKeys[def.key]=h end
+        end
+    end
 end
 function P.pressed() return action and action.pressed() or false end
 
@@ -108,7 +171,7 @@ end
 
 M=ZMLFCFactory(P)
 -- 遥控接管：模组 C++ 侧注入的模块，没注入成就是 nil，功能自然关着。
-local FPV=ZMLFCFpv
+FPV=ZMLFCFpv
 
 local function number(v,name,lo,hi,fallback)
     local x=v[name]
@@ -261,6 +324,16 @@ local function frameBody(dt)
     if not M.settings then return end
     dt=clamp(tonumber(dt) or 0,0,.1)
     if FPV then FPV.heartbeat(M,dt) end
+    local keys=FPV and M.fpvKeys
+    if keys then
+        if pressedEdge('recv',keys.recv) then
+            announce('FPV：游戏内接收开关 → '..(FPV.toggleRecv() and '开' or '关（遥控器不再接管，键鼠照常）'))
+        end
+        if pressedEdge('force',keys.force) then
+            announce('FPV：强制接管 → '..(FPV.toggleForce() and '开（忽略 arm、校准、映射检查，排障用）' or '关'))
+        end
+        if pressedEdge('check',keys.check) then announce(FPV.describe()) end
+    end
     if P.pressed() then M.toggle() end
     if M.lease and M.lease.releasing then
         if not M.release() then return end

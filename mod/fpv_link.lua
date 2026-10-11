@@ -7,6 +7,11 @@
 -- 约定：这条链路只管姿态，不管相机是不是我们拿着——拿不拿得住由 freecam.lua 判断。
 -- 任何一步不对就返回 false，让自由镜头照常用键鼠飞。
 --
+-- 游戏内的两个开关（绑在游戏原生按键设置里，freecam.lua 注册）：
+--   遥控接收开关  Ctrl+F7  关掉就完全不认遥控器，立刻交回键鼠（设置页里的 fpv 是总闸）
+--   强制接管      Ctrl+F8  排障用：忽略 arm / 校准 / 映射是否标全，只要收到包就接管
+--   链路自检      Ctrl+F9  按一下，把整条链路的状态写进 runtime.log，并尽力在游戏里弹一下
+--
 -- 遥控器上的四个开关（包里 switches 的位，见辅助程序那栏"映射"）：
 --   bit0 arm     解锁，解锁了才接管（写进 flags 的 ST_ARMED）
 --   bit1 mode    拨上去 = 纯速率（穿越机手感）；拨下来 = 自稳（松杆自动回平）
@@ -27,7 +32,23 @@ return function()
     local ROOT='ZML/Mod/freecam/'
     local PATH=ROOT..'state'
     local PUSH_ROOT=ROOT
-    local F={on=false,why='init',n=0,seq=-1,age=1e9,mode='rate'}
+    local F={on=false,why='init',n=0,seq=-1,age=1e9,mode='rate',recv=true,force=false}
+
+    -- 各种"不接管"的中文说法，自检时直接给人看
+    local WHY={
+        init='还没跑起来',off='模组设置页里的「遥控接管」关着',
+        recv_off='游戏内接收开关关着（Ctrl+F7）',
+        no_camera='自由镜头没开着（先 Ctrl+F6）',
+        no_module='没拿到 C++ 那半注入的模块，FreeCam.dll 八成不是新版',
+        no_compiler='这个 Lua 环境没有 loadstring',
+        bad_source='C++ 那半吐出来的源码编不过',bad_table='状态模块没返回表',
+        no_packet='一个状态包都没收到：辅助程序那边「发给游戏」没开，或者端口不对',
+        stale='包断了，超过 0.25 秒没有新包',
+        hold='辅助程序那边按着急停',
+        calib='辅助程序正在校准',
+        disarmed='遥控器 arm 开关没推上来',
+        not_valid='映射没标全（roll/pitch/yaw/throttle 有一路没校准），辅助程序不上报 ST_VALID',
+        ok='正常接管中'}
 
     local function fetch()
         local ok,src=pcall(function() return LuaManagerInst:LoadLua(PATH) end)
@@ -42,6 +63,9 @@ return function()
         return t
     end
 
+    function F.toggleRecv() F.recv=not F.recv;return F.recv end
+    function F.toggleForce() F.force=not F.force;return F.force end
+
     -- 拿一帧状态，顺便判断现在能不能接管。返回 true 时 F.state 是最新包。
     -- 相机不在我们手上（off / no_camera）就直接把横滚叠加角清掉；
     -- 其余"包有问题"的拒绝不清，留给 heartbeat 收着退回 0，交回键鼠时不会一巴掌扇回去。
@@ -49,6 +73,7 @@ return function()
         F.on=false
         local c=M.settings
         if not (c and c.fpv) then F.why='off';F.state=nil;M.roll=nil;return false end
+        if not F.recv then F.why='recv_off';F.state=nil;M.roll=nil;return false end
         if not M.holding() then F.why='no_camera';F.state=nil;M.roll=nil;return false end
         local t=fetch()
         if t==nil then F.state=nil;return false end
@@ -58,10 +83,13 @@ return function()
         F.age=(t.age or 1e9)/1000
         if t.ok~=1 then F.why='no_packet';return false end
         if F.age>STALE then F.why='stale';return false end
-        if tonumber(t.hold)==1 then F.why='hold';return false end
-        if tonumber(t.calib)==1 then F.why='calib';return false end
-        if tonumber(t.armed)~=1 then F.why='disarmed';return false end
-        if (tonumber(t.flags) or 0)%2==0 then F.why='not_valid';return false end  -- ST_VALID：映射没标全，归一化不可信
+        -- 强制接管是排障开关：只留"还有没有新包"这条底线，别的检查全跳过
+        if not F.force then
+            if tonumber(t.hold)==1 then F.why='hold';return false end
+            if tonumber(t.calib)==1 then F.why='calib';return false end
+            if tonumber(t.armed)~=1 then F.why='disarmed';return false end
+            if (tonumber(t.flags) or 0)%2==0 then F.why='not_valid';return false end  -- ST_VALID：映射没标全，归一化不可信
+        end
         F.why='ok'
         F.on=true
         return true
@@ -134,11 +162,45 @@ return function()
 
     -- 一秒钟一条诊断，用来看"为什么没接管 / 现在什么模式"。
     function F.status()
-        if F.state==nil then return string.format('n%d_%s',F.n,F.why) end
-        return string.format('n%d_%s_%s_seq%d_age%d_r%d_p%d_y%d_t%d_sw%d',
-            F.n,F.why,F.mode,F.seq,math.floor(F.age*1000),
+        local head=string.format('n%d_%s%s%s',F.n,F.why,F.recv and '' or '_r0',F.force and '_f1' or '')
+        if F.state==nil then return head end
+        return string.format('%s_%s_seq%d_age%d_rx%d_bad%d_r%d_p%d_y%d_t%d_sw%d',
+            head,F.mode,F.seq,math.floor(F.age*1000),
+            F.state.rx or 0,F.state.bad or 0,
             F.state.roll or 0,F.state.pitch or 0,F.state.yaw or 0,
             F.state.throttle or 0,F.state.switches or 0)
+    end
+
+    -- 一整句话，给人看的，自检键按下去时用。
+    function F.describe()
+        local t=F.state
+        local n=string.format('FPV 自检：%s',WHY[F.why] or F.why)
+        if not F.recv then n=n..'；接收开关关着' end
+        if F.force then n=n..'；强制接管开着' end
+        if t==nil then return n..'（Lua 这一帧没拿到状态模块）' end
+        return string.format('%s｜seq %d｜包龄 %dms｜游戏共收到 %d 包，坏 %d｜flags %d｜roll %d pitch %d yaw %d 油门 %d 开关 %d',
+            n,t.seq or -1,math.floor(t.age or 0),t.rx or 0,t.bad or 0,t.flags or 0,
+            t.roll or 0,t.pitch or 0,t.yaw or 0,t.throttle or 0,t.switches or 0)
+    end
+
+    -- 借 C++ 那半的模组日志把中文写进 runtime.log：路径段字符集只收 [A-Za-z0-9.-_/]，
+    -- 所以正文编成十六进制塞进 ZML/Mod/freecam/log-<hex>，C++ 那边解回来。
+    local function clip(s,max)
+        if #s<=max then return s end
+        local cut=max
+        while cut>0 do                        -- 别把多字节字符切一半
+            local b=string.byte(s,cut+1)
+            if b==nil or b<128 or b>=192 then break end
+            cut=cut-1
+        end
+        return s:sub(1,cut)
+    end
+    local function hex(s) return (s:gsub('.',function(c) return string.format('%02x',string.byte(c)) end)) end
+    function F.log(text)
+        local line=clip(tostring(text),180)
+        local ok,err=pcall(function() return LuaManagerInst:LoadLua(PUSH_ROOT..'log-'..hex(line)) end)
+        if ok then F.lastLog=line else F.logErr=tostring(err) end
+        return ok==true
     end
 
     return F

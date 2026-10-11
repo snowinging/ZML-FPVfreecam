@@ -53,6 +53,15 @@ int main(int argc, char** argv) {
         if (i == 1) {
             // 模拟 Lua 侧的回推：相机已接管 + 报帧率
             std::printf("[probe] push -> %s\n", readSource("push_cam-1_fps-57").c_str());
+            // Lua 侧的中文日志通道：正文编成十六进制塞在路径里，C++ 解回来写进模组日志
+            const char* sentence = "fpv 自检：状态包收到了，Lua 这一半也在跑";
+            std::string hexPath = "log-";
+            for (const char* at = sentence; *at; ++at) {
+                char pair[3];
+                std::snprintf(pair, sizeof(pair), "%02x", static_cast<unsigned char>(*at));
+                hexPath += pair;
+            }
+            readSource(hexPath.c_str());
         }
         std::printf("[probe] t=%ds state: %s\n", i, readSource("state").c_str());
     }
