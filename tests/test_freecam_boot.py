@@ -15,6 +15,7 @@
 跑法：python3 tests/test_freecam_boot.py
 """
 import pathlib
+import re
 import sys
 
 import lupa
@@ -55,7 +56,9 @@ end
 Q.identity=Q.Euler(0,0,0)
 CS={UnityEngine={
     Vector3=setmetatable({zero=vec(0,0,0)},{__call=function(_,x,y,z) return vec(x,y,z) end}),
-    Quaternion=Q,KeyCode={I=1,K=2,J=3,L=4,U=5,O=6,LeftShift=7,RightShift=8},
+    Quaternion=Q,KeyCode={I=1,K=2,J=3,L=4,U=5,O=6,LeftShift=7,RightShift=8,UpArrow=9,DownArrow=10,
+                     LeftArrow=11,RightArrow=12,Period=13,Slash=14,Backslash=15,Insert=16,
+                     Delete=17,End=18},
     Time={realtimeSinceStartup=0,frameCount=1,deltaTime=.02},
     Input={GetKey=function() return false end,GetAxis=function() return 0 end},
     Application={isFocused=true},GameObject=function() return nil end,Object={Destroy=function() end},
@@ -65,15 +68,18 @@ REPORTS={}
 local apiSrc=[==[
 return {report=function(id,event) REPORTS[#REPORTS+1]=event end,
     get=function() return {fov=90,sensitivity=2,speed=8,boost=4,smoothing=.12,pitch_limit=89,
-        invert_y=false,enabled=true,fpv=true,fpv_scale=1,fpv_limit=60,fpv_selflevel=true,
-        fpv_level_speed=90} end,
+        invert_y=false,enabled=true,fpv=true,fpv_limit=60,fpv_mode=0,
+        fpv_rate_roll=400,fpv_rate_pitch=400,fpv_rate_yaw=500,fpv_expo=.35,
+        fpv_deadzone=.02,fpv_tilt_max=60,fpv_angle_kp=6,fpv_angle_rate_limit=360,
+        fpv_horizon_delay=.3,fpv_thrust=24,fpv_gravity=9.81,
+        fpv_drag_linear=.02,fpv_drag_quad=.02} end,
     subscribe=function() return function() end end}
 ]==]
 local stateSrc='return {n=1,seq=7,age=0,flags=3,ok=1,armed=1,hold=0,calib=0,roll=0,pitch=0,'..
     'yaw=0,throttle=0,switches=0,buttons=0,aux=0,lost=0,fps=60,rx=7,bad=0,bind=1}'
 LuaManagerInst={LoadLua=function(self,path)
     if path=='ZML/Api' then return apiSrc end
-    if path=='ZML/Mod/freecam/state' then return stateSrc end
+    if path=='ZML/Mod/fpvfreecam/state' then return stateSrc end
     return 'return {}'
 end}
 logger={info=function() end,error=function() end}
@@ -83,12 +89,27 @@ InputManagerInst={GetAxis=function() return 0 end}
 UIUtils={IsPhaseLevelOnTop=function() return true end}
 -- PRESS=true 时除"开关"以外的键都算按下去，用来走一遍按键那条路
 PRESS=false
+-- 照 keybinds 的真接口演一遍：find 只认注册过的动作，register 是普通函数
+-- A.register(owner,def)，默认键名还得在这版游戏的枚举里（REJECT 里的算不认）。
+-- 谁要是又把 k 当 self 传给 register，owner 就成了表，这里当场空手而归。
+REJECT={}
+_ACT={}
+_DEF={}
 ZMLKeybinds={api=1,
-    find=function(id,key)
-        return {pressed=function() return PRESS==true and key~='toggle' end,
+    find=function(owner,key) return _ACT[owner..':'..key] end,
+    register=function(owner,def)
+        if type(owner)~='string' or type(def)~='table' or type(def.id)~='string' then
+            return nil,'动作声明无效'
+        end
+        local id=owner..':'..def.id
+        if _ACT[id] then return nil,'动作 ID 已注册' end
+        if REJECT[def.primary] then return nil,'默认按键不受支持' end
+        local h={pressed=function() return PRESS==true and def.id~='toggle' end,
             down=function() return false end}
-    end,
-    register=function(id,def) error('不该走到注册：键位应该已经存在') end}
+        _ACT[id]=h
+        _DEF[id]=def
+        return h
+    end}
 TICK,TAIL=nil,nil
 LOADFN=function(s) local f,e=load(s,'@probe'); if f==nil then error(e) end return f end
 LuaUpdate={Add=function(self,kind,fn)
@@ -104,10 +125,12 @@ HELPER = ('local ZMLFCFactory=(function()\n' + core + '\nend)()\n'
           'local ZMLFCFpv=(function()\n' + fpv + '\nend)()\n' + freecam)
 
 
-def boot(with_fpv=True):
-    """照 C++ 的拼法起一遍，返回 (LuaRuntime, 错误文本)。"""
+def boot(with_fpv=True, reject=()):
+    """照 C++ 的拼法起一遍，返回 (LuaRuntime, 错误文本)。reject 里的默认键名当作这版游戏不认。"""
     L = lupa.LuaRuntime()
     L.execute(GAME)
+    for k in reject:
+        L.eval('function(k) REJECT[k]=true end')(k)
     src = HELPER if with_fpv else ('local ZMLFCFactory=(function()\n' + core + '\nend)()\n' + freecam)
     try:
         L.eval('function(s) local f,e=load(s,"@freecam-helper"); if f==nil then error(e) end return f end')(src)()
@@ -134,9 +157,9 @@ L.globals()['__FPVSRC'] = fpv
 L.execute('FPVFACT=LOADFN(__FPVSRC)')
 check('C++ 调掉一层外壳后，ZMLFCFpv 还是函数（freecam.lua 得自己再叫一声）', lua(L, 'type(FPVFACT())') == 'function')
 check('再叫一声才是模块表', lua(L, 'type(FPVFACT()())') == 'table')
-check('模块里有 heartbeat / pull / attitude / describe / log',
+check('模块里有 heartbeat / pull / flight / describe / log',
       lua(L, "(function() local m=FPVFACT()() local n=0 "
-             "for _,k in ipairs({'heartbeat','pull','attitude','describe','log','toggleRecv','toggleForce'}) do "
+             "for _,k in ipairs({'heartbeat','pull','flight','describe','log','toggleRecv','toggleForce'}) do "
              "if type(m[k])=='function' then n=n+1 end end return n end)()") == 7)
 check('freecam 模块挂上 _G.ZMLFreecam', lua(L, 'type(ZMLFreecam)') == 'table')
 
@@ -146,6 +169,21 @@ check('show 没炸', lua(L, 'not ZMLFreecam.failed'), 'reports=%s' % reports(L))
 check('七个移动键 + 三个 FPV 键都注册上了',
       lua(L, "(function() local n=0 for k in pairs(ZMLFreecam.acts or {}) do n=n+1 end return n end)()") == 7 and
       lua(L, "(function() local n=0 for k in pairs(ZMLFreecam.fpvKeys or {}) do n=n+1 end return n end)()") == 3)
+check('十一个动作真进了 keybinds，owner 是模组 id 字符串',
+      lua(L, "(function() local n=0 for k in pairs(_ACT) do if k:match('^fpvfreecam:') then n=n+1 end end return n end)()") == 11)
+check('默认键就是定的那套，没在注册路上被丢掉',
+      not [r for r in reports(L) if r.startswith('key_fail')] and
+      lua(L, "_DEF['fpvfreecam:toggle'].primary") == 'Backslash' and
+      lua(L, "_DEF['fpvfreecam:forward'].primary") == 'UpArrow' and
+      lua(L, "_DEF['fpvfreecam:up'].primary") == 'Period' and
+      lua(L, "_DEF['fpvfreecam:down'].primary") == 'Slash' and
+      lua(L, "_DEF['fpvfreecam:boost'].primary") == 'RightShift' and
+      lua(L, "_DEF['fpvfreecam:fpv_recv'].primary") == 'Insert' and
+      lua(L, "_DEF['fpvfreecam:fpv_force'].primary") == 'Delete' and
+      lua(L, "_DEF['fpvfreecam:fpv_check'].primary") == 'End' and
+      lua(L, "(function() for _,d in pairs(_DEF) do if d.secondary~='None' then return false end end "
+             "return true end)()"),
+      'reports=%s' % reports(L))
 check('Tick 回调挂上了', lua(L, 'type(TICK)') == 'function')
 L.execute('TICK(0.02)')
 check('跑一帧不会死（FPV 那半炸了也不能把自由镜头带走）', lua(L, 'not ZMLFreecam.failed'),
@@ -162,6 +200,29 @@ check('按键说了话（say_ 事件）', any(r.startswith('say_') for r in repo
 check('announce 认得出 FPV，走了中文日志通道（say_l*）',
       any(r.startswith('say_l') for r in reports(L)), 'reports=%s' % reports(L))
 L.execute('PRESS=false')
+
+print('FPV 接管那一帧交给 diag 的杆量')
+# 这一条只能查源码：上面那个假环境装不起真相机，frameBody 走到 FPV 接管那一段就进不去。
+# 0.1.22 之前这里是 f,r,u,boost,mx,my=0,0,false,0,0——少一个值，u 就成了布尔，
+# diag 里 math.floor(u*10) 当场把整帧带走（游戏里看到的就是"进 freecam 两秒又退出"）。
+cands = [g.strip() for g in re.findall('f,r,u,boost,mx,my=(.+)', freecam)]
+cands = [c for c in cands if not c.startswith('readInputs')]      # 另一处是 else 里的键鼠那路
+vals = [v.split('--')[0].strip() for v in cands[0].split(',')] if cands else []
+check('六个值一个不少，u 是数字不是布尔', len(vals) == 6 and vals[2] not in ('true', 'false'),
+      '→ ' + ','.join(vals))
+
+print('有默认键名这版游戏不认时（方向键/Insert 那种真不好说）')
+L3, err3 = boot(reject=('Insert',))
+check('也能起来', not err3, err3)
+L3.execute('ZMLFreecam.show(nil)')
+check('不认的默认键退回 None，动作照样进列表：三个 FPV 键一个不少',
+      lua(L3, "(function() local n=0 for k in pairs(ZMLFreecam.fpvKeys or {}) do n=n+1 end return n end)()") == 3,
+      'reports=%s' % reports(L3))
+check('七个移动键也在',
+      lua(L3, "(function() local n=0 for k in pairs(ZMLFreecam.acts or {}) do n=n+1 end return n end)()") == 7)
+check('报了 key_fail_fpv_recv，好在日志里看见是哪个键',
+      'key_fail_fpv_recv' in reports(L3), 'reports=%s' % reports(L3))
+check('没因为一个按键把整套带下水', 'freecam_failed' not in reports(L3), 'reports=%s' % reports(L3))
 
 print('旧 DLL（根本没有 fpv 模块）的情况')
 L2, err2 = boot(with_fpv=False)
