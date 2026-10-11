@@ -2,7 +2,7 @@
 local U=CS.UnityEngine
 local V,Q=U.Vector3,U.Quaternion
 local K=U.KeyCode
-local ID='freecam'
+local ID='fpvfreecam'
 local traceback=debug and debug.traceback or function(e) return tostring(e) end
 assert(not rawget(_G,'ZMLFreecam'),'freecam namespace occupied')
 local function live(o) return o~=nil and not o:Equals(nil) end
@@ -98,20 +98,20 @@ end
 
 local action,handles,unsubscribe
 local MOVE_ACTIONS={
-    {key='f',id='forward',label='前进',primary='I'},
-    {key='b',id='back',label='后退',primary='K'},
-    {key='l',id='left',label='左移',primary='J'},
-    {key='r',id='right',label='右移',primary='L'},
-    {key='u',id='up',label='上升',primary='U'},
-    {key='d',id='down',label='下降',primary='O'},
-    {key='boost',id='boost',label='加速',primary='LeftShift'},
+    {key='f',id='forward',label='前进',primary='UpArrow'},
+    {key='b',id='back',label='后退',primary='DownArrow'},
+    {key='l',id='left',label='左移',primary='LeftArrow'},
+    {key='r',id='right',label='右移',primary='RightArrow'},
+    {key='u',id='up',label='上升',primary='Period'},
+    {key='d',id='down',label='下降',primary='Slash'},
+    {key='boost',id='boost',label='加速',primary='RightShift'},
 }
 -- 遥控接管在游戏内的三个键，都进游戏原生按键设置，绑什么主人自己改。
 -- 这三个键本身就是检测：按键列表里能看见它们，说明模组加载上了。
 local FPV_ACTIONS={
-    {key='recv',id='fpv_recv',label='遥控接收开关',primary='Ctrl+F7'},
-    {key='force',id='fpv_force',label='遥控强制接管',primary='Ctrl+F8'},
-    {key='check',id='fpv_check',label='遥控链路自检',primary='Ctrl+F9'},
+    {key='recv',id='fpv_recv',label='遥控接收开关',primary='Insert'},
+    {key='force',id='fpv_force',label='遥控强制接管',primary='Delete'},
+    {key='check',id='fpv_check',label='遥控链路自检',primary='End'},
 }
 local function ensureKeys()
     require_ex('Common/Utils/UIUtils')
@@ -119,14 +119,28 @@ local function ensureKeys()
     local k=assert(rawget(_G,'ZMLKeybinds'),'keybinds dependency unavailable')
     assert(k.api==1,'keybinds version unavailable')
     if k._attachGate then k._attachGate() end
-    action=k.find(ID,'toggle') or assert(k.register(ID,{id='toggle',name='自由镜头 · 开关',primary='Ctrl+F6',secondary='None'}))
+    -- 一个默认键名不被这个游戏版本的枚举认，就退回 None 再报一声；不能因为一个默认键
+    -- 把整套注册带下水（ensureKeys 外面虽然有 pcall，但那样连相机开关都没了）。
+    -- keybinds 的 register 是普通函数 A.register(owner,def)，不是方法，别把 k 当 self 传
+    -- （传了 owner 就成了表，register 直接回 "动作声明无效"，整套键位一个都不剩）。
+    local function regKey(id,name,primary)
+        local h,err=k.register(ID,{id=id,name=name,primary=primary,secondary='None'})
+        if h==nil and primary~='None' then
+            reportEvent('key_fail_'..id)
+            h,err=k.register(ID,{id=id,name=name,primary='None',secondary='None'})
+        end
+        if h==nil then error(('keybind %s unavailable: %s'):format(tostring(id),tostring(err))) end
+        return h
+    end
+    action=k.find(ID,'toggle') or regKey('toggle','FPV/自由镜头 · 开关','Backslash')
+    assert(action~=nil,'toggle keybind unavailable')
     assert(type(action.pressed)=='function','keybinds continuous input API required')
     -- 六向移动 + 加速都丢进游戏原生的按键设置里，各自单独绑。
     M.acts={}
     local n=0
     for _,def in ipairs(MOVE_ACTIONS) do
         local h=k.find(ID,def.id)
-        if h==nil then h=k.register(ID,{id=def.id,name='自由镜头 · '..def.label,primary=def.primary,secondary='None'}) end
+        if h==nil then h=regKey(def.id,'FPV/自由镜头 · '..def.label,def.primary) end
         if h~=nil and type(h.down)=='function' then M.acts[def.key]=h;n=n+1 end
     end
     M.bound=n
@@ -135,16 +149,16 @@ local function ensureKeys()
     M.fpvKeys={}
     for _,def in ipairs(FPV_ACTIONS) do
         local h=k.find(ID,def.id)
-        if h==nil then h=k.register(ID,{id=def.id,name='自由镜头 · '..def.label,primary=def.primary,secondary='None'}) end
+        if h==nil then h=regKey(def.id,'FPV/自由镜头 · '..def.label,def.primary) end
         if h~=nil and type(h.pressed)=='function' then M.fpvKeys[def.key]=h end
     end
 end
 function P.pressed() return action and action.pressed() or false end
 
 -- 移动输入：直接读按键状态，不再猜 Unity 轴映射（轴只留作兜底）。
--- 兜底键位：故意和角色的 WASD 完全错开，这样即使原生绑定读不到，也不会跟角色抢键。
-local KEY_SET={f={K.I},b={K.K},l={K.J},r={K.L},up={K.U},dn={K.O},
-    boost={K.LeftShift,K.RightShift}}
+-- 兜底键位和默认键位同一套（方向键 + . / 加速），全在右手区，不碰游戏的字母快捷键。
+local KEY_SET={f={K.UpArrow},b={K.DownArrow},l={K.LeftArrow},r={K.RightArrow},
+    up={K.Period},dn={K.Slash},boost={K.RightShift}}
 local input={probed=false}
 local function keySet() return KEY_SET end
 local function keyDown(k)
@@ -210,10 +224,22 @@ function M.configure(v)
     c.invert_y=bool(v,'invert_y',false)
     c.enabled=bool(v,'enabled',true)
     c.fpv=bool(v,'fpv',true)                 -- 允许遥控器（辅助程序）接管
-    c.fpv_scale=number(v,'fpv_scale',.2,4,1) -- 角速率倍率
-    c.fpv_limit=number(v,'fpv_limit',20,89,60) -- 俯仰/横滚角上限
-    c.fpv_selflevel=bool(v,'fpv_selflevel',true)     -- mode 开关在关位时自稳（松杆回平）
-    c.fpv_level_speed=number(v,'fpv_level_speed',10,400,90) -- 自稳回平速度（度/秒）
+    -- 飞控参数（抄 EEfpv）：模式、杆量口径、姿态、物理
+    c.fpv_mode=number(v,'fpv_mode',0,2,0)          -- 0 角度自稳 / 1 半自稳 / 2 acro 手动档
+    c.fpv_rate_roll=number(v,'fpv_rate_roll',50,2000,400)   -- 满杆角速度（协议 v2 起辅助程序只发杆量，这边自己说了算）
+    c.fpv_rate_pitch=number(v,'fpv_rate_pitch',50,2000,400)
+    c.fpv_rate_yaw=number(v,'fpv_rate_yaw',50,2000,500)
+    c.fpv_expo=number(v,'fpv_expo',0,.9,.35)       -- 速率模式指数曲线
+    c.fpv_deadzone=number(v,'fpv_deadzone',0,.3,.02) -- 杆量死区
+    c.fpv_tilt_max=number(v,'fpv_tilt_max',10,89,60)  -- 角度自稳最大倾角
+    c.fpv_angle_kp=number(v,'fpv_angle_kp',1,30,6)    -- 角度自稳 P 增益
+    c.fpv_horizon_delay=number(v,'fpv_horizon_delay',0,2,.3) -- 半自稳：松杆多久才开始回平
+    c.fpv_limit=number(v,'fpv_limit',20,89,60)     -- 半自稳里按速率飞那段的姿态上限（手动档不设限）
+    c.fpv_cam_tilt=number(v,'fpv_cam_tilt',0,45,15)    -- 相机在机身上的固定上仰角（穿越机都斜着装）
+    c.fpv_thrust=number(v,'fpv_thrust',5,120,24)   -- 满油门加速度（悬停油门 = 重力/这个）
+    c.fpv_gravity=number(v,'fpv_gravity',0,30,9.81) -- 重力
+    c.fpv_drag_linear=number(v,'fpv_drag_linear',0,1,.02) -- 线性阻力
+    c.fpv_drag_quad=number(v,'fpv_drag_quad',0,1,.02)     -- 二次阻力
     M.settings=c
     if not c.enabled then M.wanted=false;M.release(true) end
 end
@@ -225,7 +251,7 @@ function M.release(force)
     if l==nil then return true end
     M.releaseTries=(M.releaseTries or 0)+1
     M.releasing=true
-    local ok,done=pcall(P.release,l)
+    local ok,done,step=pcall(P.release,l)
     M.releasing=nil
     if ok and done==true then
         M.lease=nil;M.velocity=nil;M.stale=0;M.releaseTries=0
@@ -234,7 +260,7 @@ function M.release(force)
     if force or M.releaseTries>45 then
         pcall(P.releaseHard,l)
         M.lease=nil;M.velocity=nil;M.stale=0;M.releaseTries=0
-        reportEvent('release_forced',(not ok and done) or (done~=true and ('step'..tostring(done))) or nil)
+        reportEvent('release_forced',(not ok and tostring(done)) or (done~=true and ('step'..tostring(step or '?'))) or nil)
         return true
     end
     if M.releaseTries==1 then reportEvent('release_retry',ok and nil or done) end
@@ -324,9 +350,9 @@ local function diag(f,r,u,mx,my)
     local now=U.Time.realtimeSinceStartup
     if M.diagAt and now-M.diagAt<1 then return end
     M.diagAt=now
+    local function t(v) return math.floor((tonumber(v) or 0)*10) end   -- 万一混进布尔，也别把整帧带走
     reportEvent(string.format('in_i%d_f%d_r%d_u%d_mx%d_my%d_n%d_a%d_mv%d_re%d',
-        INST,math.floor(f*10),math.floor(r*10),math.floor(u*10),
-        math.floor(mx*10),math.floor(my*10),
+        INST,t(f),t(r),t(u),t(mx),t(my),
         (M.acts and not M.actsBroken) and 1 or 0,input.axis and 1 or 0,M.moveHits or 0,M.reentry or 0))
     if FPV and not M.fpvBroken then reportEvent('fpv_i'..INST..'_'..FPV.status()) end
 end
@@ -397,21 +423,32 @@ local function frameBody(dt)
     end
     local c=M.settings
     local f,r,u,boost,mx,my
+    local rotation,fpvOn
     if FPV and not M.fpvBroken and FPV.pull(M) then
-        f=FPV.attitude(M,dt,c)                  -- 遥控接管：角速率积分姿态，油门当推力
-        r,u,boost,mx,my=0,0,false,0,0
+        -- 遥控接管：飞控（EEfpv 那套）自己管姿态和速度，下面那套键鼠运动学整段跳过
+        fpvOn=true
+        rotation=FPV.flight(M,dt,c)
+        f,r,u,boost,mx,my=0,0,0,false,0,0        -- 键鼠那一路整段跳过：给 diag 一堆不会算炸的零（u 别给布尔）
+        if rotation==nil then fpvOn=false end      -- 没拿到包就还是键鼠说了算
     else
         f,r,u,boost,mx,my=readInputs(dt)
     end
     diag(f,r,u,mx,my)
-    local rotation=Q.Euler(M.pitch,M.yaw,M.roll or 0)
-    local want=(rotation*V(0,0,1))*f+(rotation*V(1,0,0))*r+V(0,1,0)*u
-    if want.sqrMagnitude>1 then want=want.normalized end
-    local target=want*(c.speed*(boost and c.boost or 1))
-    if c.smoothing>0 and dt>0 then
-        M.velocity=V.Lerp(M.velocity,target,1-math.exp(-dt/c.smoothing))
-    else
-        M.velocity=target
+    if fpvOn then
+        -- 镜头角度（穿越机上相机都是斜着装的，往上仰十几二十度，平飞时前方才在画面中间）。
+        -- 这是相机的固定安装角，只转渲染用的这个朝向，飞控那边用的是机体系姿态，一点没动。
+        rotation=FPV.camera(rotation,c)
+    end
+    if not fpvOn then
+        rotation=Q.Euler(M.pitch,M.yaw,M.roll or 0)
+        local want=(rotation*V(0,0,1))*f+(rotation*V(1,0,0))*r+V(0,1,0)*u
+        if want.sqrMagnitude>1 then want=want.normalized end
+        local target=want*(c.speed*(boost and c.boost or 1))
+        if c.smoothing>0 and dt>0 then
+            M.velocity=V.Lerp(M.velocity,target,1-math.exp(-dt/c.smoothing))
+        else
+            M.velocity=target
+        end
     end
     l.position=l.position+M.velocity*dt
     local posed,reason=P.pose(l,l.position,rotation,dt,c)

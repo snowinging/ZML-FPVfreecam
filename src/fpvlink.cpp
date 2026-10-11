@@ -15,6 +15,7 @@ namespace {
 // ---- 协议常量，与 Endfield-FpvHelper/fpvhelper/ipc.py 一一对应 ----
 constexpr unsigned short kPort = 47800;
 constexpr int kTypeState = 1, kTypeStatus = 2;
+constexpr unsigned char kProtoVer = 2;   // 2 起三路是杆量（-10000..10000）而不是角速率指令
 constexpr unsigned short ST_ARMED = 1 << 1, ST_HOLD = 1 << 2, ST_CALIB = 1 << 3;
 constexpr unsigned short SG_RUNNING = 1 << 0, SG_TAKEOVER = 1 << 1, SG_WANT_RESET = 1 << 2;
 constexpr DWORD kReplyMs = 500;      // 回执 2 Hz 够算了：辅助程序只用它判在线和算 RTT
@@ -25,7 +26,7 @@ constexpr size_t kMaxPacket = 64;
 struct WireState {
     char magic[4]; unsigned char ver, type;
     unsigned short seq; unsigned int t_ms;
-    short roll, pitch, yaw;
+    short roll, pitch, yaw;          // 杆量，-10000..10000 = -100%..100%
     unsigned short throttle, switches, buttons, aux, flags;
     unsigned int crc;
 };
@@ -81,7 +82,7 @@ void setText(std::string& out, const char* name, long long value) {
 }
 
 // 模组日志（%LOCALAPPDATA%\ZML\runtime.log）。Lua 那边也能借它写可读中文：
-// 路径 ZML/Mod/freecam/log-<十六进制>，见 applyPush。
+// 路径 ZML/Mod/fpvfreecam/log-<十六进制>，见 applyPush。
 void logLine(const std::string& text) {
     if (hostApi && hostApi->log) hostApi->log(hostApi->owner, text.c_str());
 }
@@ -186,7 +187,7 @@ void reply(const sockaddr_in& to, unsigned int now) {
     LeaveCriticalSection(&lock);
     WireStatus packet{};
     std::memcpy(packet.magic, "EFPV", 4);
-    packet.ver = 1; packet.type = static_cast<unsigned char>(kTypeStatus);
+    packet.ver = kProtoVer; packet.type = static_cast<unsigned char>(kTypeStatus);
     packet.ack_seq = copy.seq;
     packet.echo_t = copy.t_ms;
     packet.flags = SG_RUNNING;
@@ -235,7 +236,7 @@ DWORD WINAPI receiveLoop(void*) {
                 if (got == static_cast<int>(sizeof(WireState))) {
                     WireState packet{};
                     std::memcpy(&packet, buffer, sizeof(packet));
-                    bool good = std::memcmp(packet.magic, "EFPV", 4) == 0 && packet.ver == 1 &&
+                    bool good = std::memcmp(packet.magic, "EFPV", 4) == 0 && packet.ver == kProtoVer &&
                         packet.type == kTypeState &&
                         packet.crc == crc32(reinterpret_cast<const unsigned char*>(buffer), sizeof(packet) - 4);
                     if (good) {
