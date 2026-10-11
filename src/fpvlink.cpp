@@ -179,11 +179,22 @@ void reply(const sockaddr_in& to, unsigned int now) {
         reinterpret_cast<const sockaddr*>(&to), sizeof(to));
 }
 
+// 收包线程每隔一秒往模组日志里写一行，方便在游戏里出问题时定位：
+// 是压根没收到包，还是收到了却没被接管。日志在 %LOCALAPPDATA%\ZML\runtime.log。
+void logLine(const std::string& text) {
+    if (hostApi && hostApi->log) hostApi->log(hostApi->owner, text.c_str());
+}
+
 DWORD WINAPI receiveLoop(void*) {
     sockaddr_in from{};
     int fromSize = sizeof(from);
     unsigned long long lastRecv = 0;
     unsigned int lastReply = 0;
+    unsigned long long received = 0;
+    unsigned long long lastReported = 0;
+    unsigned int lastLog = 0;
+    unsigned int lastEmptyLog = 0;
+    bool announced = false;
     while (running.load(std::memory_order_relaxed)) {
         fd_set set;
         FD_ZERO(&set);
@@ -218,12 +229,37 @@ DWORD WINAPI receiveLoop(void*) {
                         snapshot.recvAt = GetTickCount64();
                         snapshot.have = true;
                         lastRecv = snapshot.recvAt;
+                        ++received;
                         LeaveCriticalSection(&lock);
                     }
                 }
             }
         }
         if (now - lastReply >= kReplyMs && lastRecv != 0) { reply(from, now); lastReply = now; }
+        if (now - lastLog >= 1000) {
+            lastLog = now;
+            EnterCriticalSection(&lock);
+            bool have = snapshot.have;
+            unsigned short seq = snapshot.seq;
+            unsigned int lost = snapshot.lost;
+            unsigned int age = have ? (now - static_cast<unsigned int>(snapshot.recvAt)) : 0;
+            LeaveCriticalSection(&lock);
+            if (have && !announced) {
+                announced = true;
+                logLine("fpv 收到第一包，seq " + std::to_string(seq));
+            }
+            if (!have) {
+                if (now - lastEmptyLog >= 5000) {
+                    lastEmptyLog = now;
+                    logLine("fpv 还没收到状态包（端口 " + std::to_string(kPort) +
+                        "），辅助程序那头的「发给游戏」开了吗");
+                }
+            } else if (received != lastReported) {
+                lastReported = received;
+                logLine("fpv 收 " + std::to_string(received) + " 包，最新 seq " + std::to_string(seq) +
+                    "，缺 " + std::to_string(lost) + "，age " + std::to_string(age) + "ms");
+            }
+        }
     }
     return 0;
 }
